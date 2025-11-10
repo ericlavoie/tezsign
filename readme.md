@@ -92,19 +92,10 @@ Assuming your host app is available in your path as `tezsign`:
 
 ## 🔒 Security
 
-Right now, `tezsign` implements the following security measures:
-
-* Minimal Armbian build (a minimal kernel is a future goal).
-* A custom signer capable of signing **only** consensus operations.
-* Read-only `bootfs`, `rootfs`, and `app` partitions.
-* A read-write, non-executable `data` partition for application data.
-* All keys and respective sensitive key data are encrypted.
-* All user accounts are disabled.*
-
-> ***Warning:** "Dev" images have a `dev` account enabled. Please do not use these images in production unless you know exactly what you are doing.
+See [security.md](https://github.com/tez-capital/tezsign/blob/main/security.md)
 
 ---
 
 ## 🛠️ Development
 
-TODO
+See [readme.dev.md](https://github.com/tez-capital/tezsign/blob/main/readme.dev.md)
