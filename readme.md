@@ -9,6 +9,8 @@
 * **Hardware Gadget:** Radxa Zero 3 OR any Raspberry Pi newer than 2 (e.g., RPi Zero 2W). An RPi 5 is *not* ideal.
 * **SD Card:** 4GB or larger. A high-quality, industrial-grade/endurance SD card is **highly recommended**.
 
+> **NOTE:** There is a known issue with the Raspberry Pi DWC2 USB driver that can cause USB stack failures. We have implemented a workaround to mitigate this, which can be found in our [DWC2 patch](httpss://github.com/tez-capital/tezsign/blob/main/armbian_userpatches/kernel/archive/bcm2711-6.12/kernel-bcm2711-current.patch). This is not an operational issue in itself, but you should be aware that the Linux kernel has been amended to address this.
+
 ---
 
 ## 🏛️ Architecture
