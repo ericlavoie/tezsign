@@ -356,11 +356,11 @@ func run(l *slog.Logger) error {
 	bLogger := broker.WithLogger(l.With("component", "broker"))
 
 	// IF0: sign channel
-	signBroker := broker.New(context.Background(), r0, w0, bLogger, broker.WithHandler(handleSignAndStatus(handleAll)))
-	_ = signBroker
+	signBroker := broker.New(r0, w0, bLogger, broker.WithHandler(handleSignAndStatus(handleAll)))
+	defer signBroker.Stop()
 	// IF1: management channel
-	mgmtBroker := broker.New(context.Background(), r1, w1, bLogger, broker.WithHandler(handleMgmtOnly(handleAll)))
-	_ = mgmtBroker
+	mgmtBroker := broker.New(r1, w1, bLogger, broker.WithHandler(handleMgmtOnly(handleAll)))
+	defer mgmtBroker.Stop()
 
 	cleanupSock := serveReadySocket(l)
 	defer cleanupSock()

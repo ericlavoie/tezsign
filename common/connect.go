@@ -47,17 +47,13 @@ type Session struct {
 	Broker  *broker.Broker
 	Channel Channel
 
-	closeBroker context.CancelFunc
-
 	Serial string
 	Log    *slog.Logger
 }
 
 // Close in reverse order of creation
 func (s *Session) Close() {
-	if s.closeBroker != nil {
-		s.closeBroker()
-	}
+	s.Broker.Stop() // this blocks until broker is fully stopped
 	if s.Intf != nil {
 		s.Intf.Close()
 	}
@@ -373,9 +369,8 @@ func Connect(p ConnectParams) (*Session, error) {
 		return nil, err
 	}
 
-	brokerContext, closeBroker := context.WithCancel(context.Background())
 	// Build broker
-	br := broker.New(brokerContext, inEp, outEp,
+	br := broker.New(inEp, outEp,
 		broker.WithLogger(l.With("component", "broker", "chan", map[Channel]string{ChanSign: "sign", ChanMgmt: "mgmt"}[p.Channel])),
 		broker.WithHandler(p.BrokerHandler),
 	)
@@ -392,8 +387,6 @@ func Connect(p ConnectParams) (*Session, error) {
 		OutEp:   outEp,
 		Broker:  br,
 		Channel: p.Channel,
-
-		closeBroker: closeBroker,
 
 		Serial: chosenSerial,
 		Log:    l,

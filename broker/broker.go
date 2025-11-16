@@ -63,10 +63,12 @@ type Broker struct {
 	capacity int
 	logger   *slog.Logger
 
-	ctx context.Context
+	ctx          context.Context
+	cancel       context.CancelFunc
+	readLoopDone <-chan struct{}
 }
 
-func New(ctx context.Context, r ReadContexter, w WriteContexter, opts ...Option) *Broker {
+func New(r ReadContexter, w WriteContexter, opts ...Option) *Broker {
 	o := &options{
 		bufSize: DEFAULT_BROKER_CAPACITY,
 	}
@@ -82,6 +84,7 @@ func New(ctx context.Context, r ReadContexter, w WriteContexter, opts ...Option)
 		panic("broker: handler is required (use WithHandler)")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	b := &Broker{
 		r:        r,
 		w:        w,
@@ -90,9 +93,10 @@ func New(ctx context.Context, r ReadContexter, w WriteContexter, opts ...Option)
 		handler:  o.handler,
 		stash:    newStash(o.bufSize, o.logger),
 		ctx:      ctx,
+		cancel:   cancel,
 	}
 
-	go b.readLoop()
+	b.readLoopDone = b.readLoop()
 	return b
 }
 
@@ -128,26 +132,31 @@ func (b *Broker) Request(ctx context.Context, payload []byte) ([]byte, [16]byte,
 	}
 }
 
-func (b *Broker) readLoop() {
-	var buf [DEFAULT_READ_BUFFER]byte
-	for {
-		n, err := b.r.ReadContext(b.ctx, buf[:])
-		if n > 0 {
-			b.stash.Write(buf[:n])
-			clear(buf[:n]) // clear buffer after we used it
-			b.processStash()
-		}
-
-		if err != nil {
-			if isRetryable(err) {
-				b.logger.Debug("read retryable error", slog.Any("err", err))
-				time.Sleep(2 * time.Millisecond)
-				continue
+func (b *Broker) readLoop() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var buf [DEFAULT_READ_BUFFER]byte
+		for {
+			n, err := b.r.ReadContext(b.ctx, buf[:])
+			if n > 0 {
+				b.stash.Write(buf[:n])
+				clear(buf[:n]) // clear buffer after we used it
+				b.processStash()
 			}
-			b.logger.Debug("read loop exit", slog.Any("err", err))
-			return
+
+			if err != nil {
+				if isRetryable(err) {
+					b.logger.Debug("read retryable error", slog.Any("err", err))
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				b.logger.Debug("read loop exit", slog.Any("err", err))
+				return
+			}
 		}
-	}
+	}()
+	return done
 }
 
 func (b *Broker) processStash() {
@@ -208,6 +217,11 @@ func (b *Broker) writeFrame(ctx context.Context, msgType payloadType, id [16]byt
 	}
 	_, err = b.w.WriteContext(ctx, frame)
 	return err
+}
+
+func (b *Broker) Stop() {
+	b.cancel()
+	<-b.readLoopDone
 }
 
 func isRetryable(err error) bool {
