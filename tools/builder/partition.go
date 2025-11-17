@@ -49,10 +49,10 @@ func resizeImage(imagePath string, flavour imageFlavour, logger *slog.Logger) (*
 	imgPartitions := partitionTable.GetPartitions()
 	rootPartition := imgPartitions[len(imgPartitions)-1]                // last partition is rootfs
 	rootFsPartitionStart := rootPartition.GetStart() / logicalBlockSize // 0 indexed
+	rootfsSizeInSectors := uint64(rootPartition.GetSize() / logicalBlockSize)
 	sectorsPerMB := uint64(1024 * 1024 / logicalBlockSize)
 	img.Close()
 
-	rootfsSizeInSectors := uint64(rootPartitionSizeMB * sectorsPerMB)
 	appSizeInSectors := uint64(appPartitionSizeMB * sectorsPerMB)
 	dataSizeInSectors := uint64(dataPartitionSizeMB * sectorsPerMB)
 

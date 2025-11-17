@@ -1,9 +1,7 @@
 package main
 
 import (
-	"log"
 	"os"
-	"strconv"
 )
 
 type imageFlavour string
@@ -22,22 +20,6 @@ const (
 
 	DISABLE_UNMOUNTS = false // set to true to disable unmounts for debugging
 )
-
-var (
-	rootPartitionSizeMB = uint64(756)
-)
-
-func init() {
-	envValue := os.Getenv("ROOT_PARTITION_SIZE_MB")
-	if envValue != "" {
-		var err error
-		size, err := strconv.ParseUint(envValue, 10, 64)
-		if err != nil {
-			log.Fatalf("Invalid ROOT_PARTITION_SIZE_MB value: %v", err)
-		}
-		rootPartitionSizeMB = size
-	}
-}
 
 var (
 	// alignPartitionsTo = uint64(3 * 1024 * 1024 * 1024) // Default to 2GB alignment
