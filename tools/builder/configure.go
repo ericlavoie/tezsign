@@ -253,6 +253,28 @@ func patchAppPartition(imgPath string, appPartition part.Partition, flavour imag
 	return nil
 }
 
+func patchDataPartition(imgPath string, dataPartition part.Partition, flavour imageFlavour, logger *slog.Logger) error {
+	datafs := path.Join(workDir, "datafs")
+
+	unmount, err := fuse2fs_mount(imgPath, datafs, int(dataPartition.GetStart()), logger)
+	if err != nil {
+		return err
+	}
+	_ = unmount
+	defer unmount(true)
+
+	// create data dir and set ownership to tezsign user
+	dataMountPoint := path.Join(datafs, "tezsign")
+	if err := os.MkdirAll(dataMountPoint, 0755); err != nil {
+		return fmt.Errorf("failed to create data mount point %s: %w", dataMountPoint, err)
+	}
+	if err := os.Chown(dataMountPoint, 1000, 1000); err != nil {
+		return fmt.Errorf("failed to chown data mount point %s: %w", dataMountPoint, err)
+	}
+
+	return nil
+}
+
 func setupModules(rootFsPath, fileName string, modules []string, logger *slog.Logger) error {
 	modulesLoadPath := path.Join(rootFsPath, "etc", "modules-load.d", fileName)
 	return os.WriteFile(modulesLoadPath, []byte(strings.Join(modules, "\n")), 0644)
@@ -269,15 +291,6 @@ func patchRootPartition(imgPath string, rootPartition part.Partition, flavour im
 	// Patch /etc/fstab
 	rootfs := path.Join(workDir, "rootfs")
 	fstabPath := path.Join(rootfs, "etc", "fstab")
-
-	// create data dir and set ownership to tezsign user
-	dataMountPoint := path.Join(rootfs, "data", "tezsign")
-	if err := os.MkdirAll(dataMountPoint, 0755); err != nil {
-		return fmt.Errorf("failed to create data mount point %s: %w", dataMountPoint, err)
-	}
-	if err := os.Chown(dataMountPoint, 1000, 1000); err != nil {
-		return fmt.Errorf("failed to chown data mount point %s: %w", dataMountPoint, err)
-	}
 
 	err = PathFsTab(fstabPath, []mount{
 		{point: "tmpfs /tmp", options: []string{"tmpfs", "defaults,noatime,nosuid,size=50m"}},
@@ -424,6 +437,10 @@ func ConfigureImage(workDir, imagePath string, flavour imageFlavour, logger *slo
 	}
 
 	if err := patchAppPartition(imagePath, appPartition, flavour, logger); err != nil {
+		return errors.Join(common.ErrFailedToConfigureImage, err)
+	}
+
+	if err := patchDataPartition(imagePath, dataPartition, flavour, logger); err != nil {
 		return errors.Join(common.ErrFailedToConfigureImage, err)
 	}
 
