@@ -5,15 +5,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
-	"sync"
+	"path/filepath"
+	"strconv"
+	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/diskfs/go-diskfs"
-	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/disk"
-	"github.com/diskfs/go-diskfs/partition/part"
-	"github.com/samber/lo"
-	"github.com/tez-capital/tezsign/tools/common"
+	"github.com/diskfs/go-diskfs/partition"
+	"github.com/diskfs/go-diskfs/partition/gpt"
+	"github.com/diskfs/go-diskfs/partition/mbr"
+	"github.com/tez-capital/tezsign/logging"
+	"github.com/tez-capital/tezsign/tools/constants"
 )
 
 type UpdateKind string
@@ -23,181 +28,364 @@ const (
 	UpdateKindAppOnly UpdateKind = "app"
 )
 
-func validateTezsignImage(disk *disk.Disk, appPartition part.Partition) (bool, error) {
-	indexOfAppPartition := lo.IndexOf(disk.Table.GetPartitions(), appPartition)
-	if indexOfAppPartition == -1 {
-		return false, errors.New("app partition not found")
-	}
-
-	fs, err := disk.GetFilesystem(indexOfAppPartition + 1)
-	if err != nil {
-		return false, errors.New("failed to get filesystem")
-	}
-
-	if _, err = fs.OpenFile("/tezsign", os.O_RDONLY); err != nil {
-		return false, errors.New("failed to verify that destination device is a TezSign")
-	}
-	return true, nil
-}
-
-func loadImageForUpdate(path string, logger *slog.Logger) (*disk.Disk, part.Partition, part.Partition, part.Partition, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0600)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to open device %s: %w", path, err)
-	}
-
-	disk, err := diskfs.OpenBackend(file.New(f, false), diskfs.WithOpenMode(diskfs.ReadWriteExclusive), diskfs.WithSectorSize(diskfs.SectorSizeDefault))
-	if err != nil {
-		return nil, nil, nil, nil, errors.New("failed to open disk backend")
-	}
-
-	destinationBootPartition, destinationRootfsPartition, destinationAppPartition, _, err := common.GetTezsignPartitions(disk)
-	if err != nil {
-		return nil, nil, nil, nil, errors.New("failed to read partitions from the destination device")
-	}
-
-	isTezsign, err := validateTezsignImage(disk, destinationAppPartition)
-	if err != nil || !isTezsign {
-		return nil, nil, nil, nil, errors.New("the destination device is not a valid TezSign image")
-	}
-
-	return disk, destinationBootPartition, destinationRootfsPartition, destinationAppPartition, nil
-}
-
-func copyPartitionData(srcDisk *disk.Disk, srcPartition part.Partition, dstDisk *disk.Disk, dstPartition part.Partition, logger *slog.Logger) error {
-	pr, pw := io.Pipe()
-	writableDst, err := dstDisk.Backend.Writable()
-	if err != nil {
-		return errors.New("failed to get writable backend for destination disk")
-	}
-
-	progressLogger := NewProgressLogger(pw, logger)
-
-	var wg sync.WaitGroup
-	var readErr, writeErr error
-	var readBytes int64
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer pw.Close() // Close the writer side of the pipe when done
-
-		// ReadContents(backend, out io.Writer) streams data FROM the partition TO the provided writer (pw).
-		readBytes, readErr = srcPartition.ReadContents(srcDisk.Backend, progressLogger)
-		if readErr != nil {
-			logger.Error("Failed to read contents from source partition", "error", readErr)
-			return
-		}
-	}()
-
-	writtenBytes, writeErr := dstPartition.WriteContents(writableDst, pr)
-	if writeErr != nil {
-		logger.Error("Failed to write contents to destination partition", "error", writeErr)
-	}
-	pr.Close()
-	wg.Wait()
-
-	if readErr != nil {
-		return errors.New("error occurred while reading from source partition: " + readErr.Error())
-	}
-	if writeErr != nil {
-		return errors.New("error occurred while writing to destination partition: " + writeErr.Error())
-	}
-	if uint64(readBytes) != writtenBytes {
-		return errors.New("mismatch in bytes read and written")
-	}
-	return nil
-}
-
 func main() {
-	if len(os.Args) < 3 {
-		slog.Error("Usage: tezsign_updater <source_img> <destination_device>")
-		os.Exit(1)
+	logger, _ := logging.NewFromEnv()
+
+	args := os.Args[1:]
+	if hasHelpFlag(args) {
+		printUsage()
+		return
 	}
 
-	source := os.Args[1]
-	destination := os.Args[2]
-
-	kind := UpdateKindFull
-	if len(os.Args) >= 4 {
-		kind = UpdateKind(os.Args[3])
-		switch kind {
-		case UpdateKindFull, UpdateKindAppOnly:
-			// valid kind
-		default:
-			slog.Error("Invalid update kind. Valid options are: full, app")
-			os.Exit(1)
-		}
+	var source string
+	var appBinary string
+	var sourceProvided bool
+	if len(args) >= 1 {
+		source = args[0]
+		sourceProvided = true
+		appBinary = source // allow supplying only the source while still using interactive flow
 	}
 
-	slog.Info("Starting TezSign updater", "source", source, "destination", destination)
-
-	// load source image for update
-	sourceImg, sourceBootPartition, sourceRootfsPartition, sourceAppPartition, err := loadImageForUpdate(source, slog.Default())
-	if err != nil {
-		slog.Error("Failed to load source image for update", "error", err.Error())
-		os.Exit(1)
-	}
-	defer sourceImg.Close()
-
-	// Load the image for update
-	dstImg, destinationBootPartition, destinationRootfsPartition, destinationAppPartition, err := loadImageForUpdate(destination, slog.Default())
-	if err != nil {
-		slog.Error("Failed to load image for update", "error", err.Error())
-		os.Exit(1)
-	}
-
-	if kind == UpdateKindFull {
-		if (sourceBootPartition == nil || destinationBootPartition == nil) && (sourceBootPartition != destinationBootPartition) {
-			slog.Error("Boot partition missing in source image or destination device, cannot proceed with full update")
-			os.Exit(1)
-		}
-		if sourceBootPartition != nil && sourceBootPartition.GetSize() != destinationBootPartition.GetSize() {
-			slog.Error("Boot partition size mismatch between source image and destination device, cannot proceed with update")
-			os.Exit(1)
-		}
-
-		if sourceRootfsPartition.GetSize() != destinationRootfsPartition.GetSize() {
-			slog.Error("Rootfs partition size mismatch between source image and destination device, cannot proceed with update")
-			os.Exit(1)
-		}
-
-		if sourceAppPartition.GetSize() != destinationAppPartition.GetSize() {
-			slog.Error("App partition size mismatch between source image and destination device, cannot proceed with update")
-			os.Exit(1)
-		}
-
-		if sourceBootPartition != nil {
-			slog.Info("Updating boot partition...")
-			if err = copyPartitionData(sourceImg, sourceBootPartition, dstImg, destinationBootPartition, slog.Default()); err != nil {
-				slog.Error("Failed to update boot partition", "error", err.Error())
+	// Keep the previous non-interactive flow when destination is provided explicitly.
+	if sourceProvided && len(args) >= 2 {
+		destination := args[1]
+		kind := UpdateKindFull
+		if len(args) >= 3 {
+			kind = UpdateKind(args[2])
+			switch kind {
+			case UpdateKindFull, UpdateKindAppOnly:
+			default:
+				logger.Error("Invalid update kind. Valid options are: full, app")
 				os.Exit(1)
 			}
 		}
 
-		slog.Info("Updating rootfs partition...")
-		if err = copyPartitionData(sourceImg, sourceRootfsPartition, dstImg, destinationRootfsPartition, slog.Default()); err != nil {
-			slog.Error("Failed to update rootfs partition", "error", err.Error())
+		switch kind {
+		case UpdateKindFull:
+			if err := performUpdate(source, destination, kind, logger); err != nil {
+				logger.Error("Update failed", "error", err)
+				os.Exit(1)
+			}
+		case UpdateKindAppOnly:
+			appBinary = source
+			if err := performAppBinaryUpdate(appBinary, destination, logger); err != nil {
+				logger.Error("Update failed", "error", err)
+				os.Exit(1)
+			}
+		default:
+			logger.Error("Invalid update kind. Valid options are: full, app")
 			os.Exit(1)
 		}
 
-		slog.Info("Updating app partition...")
-		if err = copyPartitionData(sourceImg, sourceAppPartition, dstImg, destinationAppPartition, slog.Default()); err != nil {
-			slog.Error("Failed to update app partition", "error", err.Error())
-			os.Exit(1)
-		}
-
+		logger.Info("Update completed successfully")
+		return
 	}
 
-	if kind == UpdateKindAppOnly {
-		// TODO: directly inject tezsign gadget binary
-		slog.Info("Updating app partition...")
-		if err = copyPartitionData(sourceImg, sourceAppPartition, dstImg, destinationAppPartition, slog.Default()); err != nil {
-			slog.Error("Failed to update app partition", "error", err.Error())
+	devices, err := discoverTezsignDevices(logger)
+	if err != nil {
+		logger.Error("Failed to discover TezSign devices", "error", err)
+		os.Exit(1)
+	}
+
+	selectedDevice, kind, err := runSelection(devices)
+	if err != nil {
+		logger.Error("Selection failed", "error", err)
+		os.Exit(1)
+	}
+
+	if !sourceProvided {
+		switch kind {
+		case UpdateKindFull:
+			flavour, err := deviceFlavour(selectedDevice.Path)
+			if err != nil {
+				logger.Error("Failed to detect device flavor", "error", err)
+				os.Exit(1)
+			}
+			url := fmt.Sprintf("%s%s.img.xz", constants.LatestReleaseURL, flavour)
+			downloaded, cleanupFn, err := downloadWithProgress(url)
+			if err != nil {
+				logger.Error("Failed to download image", "error", err)
+				os.Exit(1)
+			}
+			defer cleanupFn()
+			source = downloaded
+		case UpdateKindAppOnly:
+			url := fmt.Sprintf("%s%s", constants.LatestReleaseURL, constants.AppBinaryName)
+			downloaded, cleanupFn, err := downloadWithProgress(url)
+			if err != nil {
+				logger.Error("Failed to download gadget binary", "error", err)
+				os.Exit(1)
+			}
+			defer cleanupFn()
+			appBinary = downloaded
+		default:
+			logger.Error("Unsupported update kind", "kind", kind)
 			os.Exit(1)
 		}
 	}
-	dstImg.Close()
 
-	slog.Info("Update completed successfully.")
+	switch kind {
+	case UpdateKindFull:
+		if _, err := os.Stat(source); err != nil {
+			logger.Error("Invalid source image", "error", err)
+			os.Exit(1)
+		}
+	case UpdateKindAppOnly:
+		if _, err := os.Stat(appBinary); err != nil {
+			logger.Error("Invalid gadget binary", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("Updating %s with a %s update...\n\n", selectedDevice.Path, string(kind))
+
+	switch kind {
+	case UpdateKindFull:
+		if err := performUpdate(source, selectedDevice.Path, kind, logger); err != nil {
+			logger.Error("Update failed", "error", err)
+			os.Exit(1)
+		}
+	case UpdateKindAppOnly:
+		if err := performAppBinaryUpdate(appBinary, selectedDevice.Path, logger); err != nil {
+			logger.Error("Update failed", "error", err)
+			os.Exit(1)
+		}
+	default:
+		logger.Error("Unsupported update kind", "kind", kind)
+		os.Exit(1)
+	}
+
+	fmt.Println("✅ Update completed successfully")
+}
+
+func readSysfsValue(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func readBlockSizeBytes(name string) uint64 {
+	sizeContent := readSysfsValue(filepath.Join("/sys/block", name, "size"))
+	sectors, err := strconv.ParseUint(strings.TrimSpace(sizeContent), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return sectors * 512 // sectors are 512-byte blocks
+}
+
+func hasExpectedPartitionCount(t partition.Table) bool {
+	switch tt := t.(type) {
+	case *gpt.Table:
+		return len(tt.Partitions) >= 3
+	case *mbr.Table:
+		nonZero := 0
+		for _, p := range tt.Partitions {
+			if p != nil && p.Size > 0 {
+				nonZero++
+			}
+		}
+		return nonZero == 4
+	default:
+		return false
+	}
+}
+
+func checkTezsignMarker(disk *disk.Disk) (bool, error) {
+	table, err := disk.GetPartitionTable()
+	if err != nil {
+		return false, err
+	}
+	if !hasExpectedPartitionCount(table) {
+		return false, nil
+	}
+	hasApp := false
+	hasData := false
+	for idx := range table.GetPartitions() {
+		fs, err := disk.GetFilesystem(idx + 1)
+		if err == nil {
+			label := strings.TrimSpace(fs.Label())
+			if label == constants.AppPartitionLabel {
+				if _, err := fs.OpenFile("/tezsign", os.O_RDONLY); err == nil {
+					hasApp = true
+				}
+			}
+			if label == constants.DataPartitionLabel {
+				hasData = true
+			}
+		}
+	}
+	return hasApp && hasData, nil
+}
+
+func probeTezsignDevice(path string) (bool, string) {
+	disk, _, _, _, err := loadImage(path, diskfs.ReadOnly)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer disk.Close()
+
+	ok, err := checkTezsignMarker(disk)
+	switch {
+	case err != nil:
+		return false, "marker check failed"
+	case !ok:
+		return false, "device does not match TezSign layout"
+	default:
+		return true, "OK"
+	}
+}
+
+func discoverTezsignDevices(logger *slog.Logger) ([]deviceCandidate, error) {
+	paths, err := filepath.Glob("/sys/block/*/removable")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list block devices: %w", err)
+	}
+
+	var devices []deviceCandidate
+	for _, removablePath := range paths {
+		flag, err := os.ReadFile(removablePath)
+		if err != nil || strings.TrimSpace(string(flag)) != "1" {
+			continue
+		}
+
+		name := filepath.Base(filepath.Dir(removablePath))
+		if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") {
+			continue
+		}
+
+		devicePath := filepath.Join("/dev", name)
+		sizeBytes := readBlockSizeBytes(name)
+		model := strings.TrimSpace(readSysfsValue(filepath.Join("/sys/block", name, "device/model")))
+
+		isTezsign, status := probeTezsignDevice(devicePath)
+		if !isTezsign {
+			logger.Debug("Device did not validate as TezSign", "device", devicePath, "status", status)
+		}
+
+		devices = append(devices, deviceCandidate{
+			Name:      name,
+			Path:      devicePath,
+			SizeBytes: sizeBytes,
+			Model:     model,
+			Status:    status,
+			Valid:     isTezsign,
+		})
+	}
+
+	if len(devices) == 0 {
+		return nil, errors.New("no removable block devices detected")
+	}
+
+	return devices, nil
+}
+
+func runSelection(devices []deviceCandidate) (deviceCandidate, UpdateKind, error) {
+	program := tea.NewProgram(newSelectionModel(devices))
+	model, err := program.Run()
+	if err != nil {
+		return deviceCandidate{}, "", err
+	}
+
+	selection, ok := model.(selectionModel)
+	if !ok {
+		return deviceCandidate{}, "", errors.New("failed to read selection state")
+	}
+
+	if selection.err != nil {
+		return deviceCandidate{}, "", selection.err
+	}
+
+	if selection.selectedDevice == nil {
+		return deviceCandidate{}, "", errors.New("no device selected")
+	}
+
+	return *selection.selectedDevice, selection.selectedKind, nil
+}
+
+func downloadWithProgress(url string) (string, func(), error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to download image: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return "", nil, fmt.Errorf("failed to download image: %s", resp.Status)
+	}
+
+	tmpFile, err := os.CreateTemp("", "tezsign_download_*.img.xz")
+	if err != nil {
+		resp.Body.Close()
+		return "", nil, fmt.Errorf("failed to create temp file for download: %w", err)
+	}
+
+	total := resp.ContentLength
+	cr := &countingReader{r: resp.Body}
+	cancel := func() {
+		resp.Body.Close()
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+	}
+
+	title := fmt.Sprintf("Download %s → %s", filepath.Base(url), filepath.Base(tmpFile.Name()))
+	p := tea.NewProgram(newProgressModel(title, total, cr, cancel))
+
+	go func() {
+		_, copyErr := io.Copy(tmpFile, cr)
+		tmpFile.Close()
+		resp.Body.Close()
+		p.Send(finishMsg{err: copyErr})
+	}()
+
+	model, progErr := p.Run()
+	if progErr != nil {
+		cancel()
+		return "", nil, fmt.Errorf("failed to render download progress: %w", progErr)
+	}
+
+	res, ok := model.(progressModel)
+	if !ok {
+		cancel()
+		return "", nil, errors.New("unexpected model type after download")
+	}
+
+	if res.err != nil {
+		cancel()
+		return "", nil, fmt.Errorf("failed to download image: %w", res.err)
+	}
+
+	cleanup := func() {
+		os.Remove(tmpFile.Name())
+	}
+
+	return tmpFile.Name(), cleanup, nil
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "-help" || arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func printUsage() {
+	bin := filepath.Base(os.Args[0])
+	fmt.Printf(`TezSign Updater
+
+Usage:
+  %[1]s
+      Interactive mode: pick a device and download the latest release automatically.
+  %[1]s <source>
+      Interactive mode using a local image/binary; destination is still selected interactively.
+  %[1]s <source> <destination> [full|app]
+      Non-interactive update using local files (default kind: full).
+  %[1]s <app_binary> <destination> app
+      App-only update with a prebuilt gadget binary.
+
+Options:
+  -h, --help    Show this help message.
+`, bin)
 }
